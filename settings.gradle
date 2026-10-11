@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "xiaoxiai"
+rootProject.name = "localbuddy-android"
 include ':app'

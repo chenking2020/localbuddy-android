@@ -11,13 +11,13 @@ if (keystorePropsFile.exists()) {
     keystoreProps.load(new FileInputStream(keystorePropsFile))
 }
 android {
-    namespace 'com.example.xiaoxiai'
+    namespace 'com.example.localbuddy'
     compileSdk {
         version = release(36)
     }
 
     defaultConfig {
-        applicationId "com.example.xiaoxiai"
+        applicationId "com.example.localbuddy"
         minSdk 26
         targetSdk 36
         versionCode 1

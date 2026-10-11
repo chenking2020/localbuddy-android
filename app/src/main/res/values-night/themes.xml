@@ -2,5 +2,5 @@
 <resources>
     <!-- 系统深色模式下的启动主题：改用深色 Material 主题，避免冷启动白屏闪烁。
          仅跟随系统夜间模式（XML 主题无法读取用户的强制偏好；Compose 加载后立即按偏好生效）。 -->
-    <style name="Theme.Xiaoxiai" parent="android:Theme.Material.NoActionBar" />
+    <style name="Theme.Localbuddy" parent="android:Theme.Material.NoActionBar" />
 </resources>

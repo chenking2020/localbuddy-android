@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 离线AI宝 启动图标前景：白色对话气泡（3 圆点镂空透出背景渐变）+ 右上 AI 四角星闪光。
+<!-- 端侧离线工作搭子 启动图标前景：白色对话气泡（3 圆点镂空透出背景渐变）+ 右上 AI 四角星闪光。
      坐标在 108×108 视口的安全区（中心 54,54）内，圆形/圆角等遮罩均不裁切主体。 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
