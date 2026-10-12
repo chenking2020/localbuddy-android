@@ -2,27 +2,48 @@ package com.example.localbuddy
 
 import android.Manifest
 import android.content.pm.PackageManager
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.GestureCancellationException
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -30,6 +51,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -38,7 +60,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -47,7 +72,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 首页两种交互模式：文本对话 / 语音通话。
@@ -60,6 +93,9 @@ enum class HomeChatMode(val label: String) {
 
 /** 首页智能体宫格一行几张小卡片。 */
 private const val AGENT_GRID_COLUMNS = 3
+
+/** 语音输入的三个阶段：空闲 / 录音中 / 识别中。 */
+private enum class VoiceInputPhase { IDLE, RECORDING, RECOGNIZING }
 
 /**
  * 融合首页：顶部应用栏 + 六个智能体小卡片 + 模式切换 + 对话/通话区 + 底部输入/通话控件。
@@ -83,10 +119,12 @@ fun HomeChatScreen(
     val focusManager = LocalFocusManager.current
 
     var mode by remember { mutableStateOf(HomeChatMode.TEXT) }
-    var showHistory by remember { mutableStateOf(false) }
+    /** 左侧抽屉：历史记录与「新建任务」入口都在这里。 */
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
 
     val chatList = rememberLazyListState()
     val callList = rememberLazyListState()
+    val scope = rememberCoroutineScope()
 
     // ── 文本对话：上传文档（针对文档问答） ──
     val pickMimes = arrayOf(
@@ -111,16 +149,136 @@ fun HomeChatScreen(
         }
     }
 
-    // ── 语音通话：麦克风权限 ──
+    // ── 麦克风权限：语音通话与语音输入共用同一个申请器 ──
+    var pendingMicAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var pendingMicDenied by remember { mutableStateOf<String?>(null) }
+    var voicePhase by remember { mutableStateOf(VoiceInputPhase.IDLE) }
+    var voiceError by remember { mutableStateOf<String?>(null) }
+    var recorder by remember { mutableStateOf<MicRecorder?>(null) }
+    /** 手势被取消时置位，让录音协程丢弃这段音频。 */
+    val voiceCancel = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+
     val micLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) callVm.startCall() else callVm.fail("需要麦克风权限才能进行语音通话")
+        val action = pendingMicAction
+        val denied = pendingMicDenied
+        pendingMicAction = null
+        pendingMicDenied = null
+        if (granted) action?.invoke() else voiceError = denied ?: "需要麦克风权限"
     }
-    fun requestCall() {
+
+    /** 麦克风权限统一入口：已授权直接执行，否则弹系统授权框。 */
+    fun requireMic(action: () -> Unit, deniedMsg: String) {
         val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
-        if (granted) callVm.startCall() else micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        if (granted) {
+            action()
+        } else {
+            pendingMicAction = action
+            pendingMicDenied = deniedMsg
+            micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    fun requestCall() {
+        requireMic({ callVm.startCall() }, "需要麦克风权限才能进行语音通话")
+    }
+
+    /**
+     * 切到某个模式。两种模式都要用麦克风，LLM 推理同时只能服务一路，所以切换前先把另一路停下来。
+     */
+    fun switchTo(m: HomeChatMode) {
+        if (m == mode) return
+        if (m == HomeChatMode.VOICE) {
+            focusManager.clearFocus()
+            if (ts.generating) textVm.stop()
+            recorder?.stop()          // 语音输入正在录的话先收掉，别和通话抢麦克风
+        } else {
+            callVm.hangUp()
+        }
+        mode = m
+    }
+
+    /** 开一个新任务：断开当前会话（旧的已进历史），按选中的类型切换模式。 */
+    fun startNewTask(m: HomeChatMode) {
+        focusManager.clearFocus()
+        textVm.clearChat()
+        switchTo(m)
+    }
+
+    /**
+     * 语音输入：按住说话 → 松开结束录音 → 端侧 ASR → 转写文本直接发起对话（与微信一致）。
+     * [voiceCancel] 用于「手势被系统打断」时丢弃这段录音。
+     */
+    fun beginVoiceInput() {
+        if (voicePhase != VoiceInputPhase.IDLE || ts.generating) return
+        voiceCancel.set(false)
+        requireMic({
+            scope.launch(Dispatchers.Default) {
+                voicePhase = VoiceInputPhase.RECORDING
+                val rec = MicRecorder(pauseMs = 800, maxSegMs = 20_000)
+                recorder = rec
+                // 30 秒还没等到一句完整的话就自动收尾，避免一直占着麦克风
+                val pcm = withTimeoutOrNull(30_000L) { rec.stream().firstOrNull() } ?: FloatArray(0)
+                rec.stop()
+                recorder = null
+                if (pcm.isEmpty() || voiceCancel.get()) {
+                    voicePhase = VoiceInputPhase.IDLE
+                    return@launch
+                }
+                voicePhase = VoiceInputPhase.RECOGNIZING
+                val result = runCatching {
+                    val engine = SpeechMTEngine.get(context.applicationContext)
+                    engine.warmUp()                       // 幂等；首次会解包并加载 ASR 模型
+                    engine.asrDetect(pcm).text.trim()
+                }
+                withContext(Dispatchers.Main) {
+                    voicePhase = VoiceInputPhase.IDLE
+                    result.onSuccess { text ->
+                        if (text.isBlank()) {
+                            voiceError = "没听清，请再说一次"
+                        } else {
+                            focusManager.clearFocus()
+                            textVm.setInput(text)
+                            textVm.send()
+                        }
+                    }.onFailure { e ->
+                        voiceError = "语音识别失败：${e.message ?: "未知错误"}"
+                    }
+                }
+            }
+        }, "需要麦克风权限才能使用语音输入")
+    }
+
+    /**
+     * 松开手指：结束录音并进入识别。
+     * @param cancelled 手势被取消（手指滑出按钮、被系统打断）——这段录音直接丢弃，不识别。
+     */
+    fun finishVoiceInput(cancelled: Boolean) {
+        if (voicePhase != VoiceInputPhase.RECORDING) {
+            // 还没真正开始录（例如卡在权限弹窗上），松手就当作放弃这次输入
+            voiceCancel.set(true)
+            return
+        }
+        if (cancelled) voiceCancel.set(true)
+        recorder?.stop()
+    }
+
+    // 按住说话、松开发送：与微信语音输入一致
+    val micGesture = Modifier.pointerInput(Unit) {
+        detectTapGestures(
+            onPress = {
+                beginVoiceInput()
+                val released = try {
+                    tryAwaitRelease()
+                    true
+                } catch (e: GestureCancellationException) {
+                    false
+                }
+                finishVoiceInput(cancelled = !released)
+            }
+        )
     }
 
     // 离开首页彻底释放麦克风：本页不像 VoiceCallScreen 那样有单独的返回动作，
@@ -170,171 +328,458 @@ fun HomeChatScreen(
         if (cs.turns.isNotEmpty()) runCatching { callList.animateScrollToItem(cs.turns.lastIndex) }
     }
 
-    // 已经有会话内容时，智能体区折叠成一条横向滑动条，把高度让给对话区
-    val hasConversation = ts.messages.isNotEmpty() || cs.inCall || cs.turns.isNotEmpty()
+    // 智能体小卡片只在「首页最初状态」出现：一旦进入对话/通话就整个收起，
+    // 从抽屉里开新任务回到初始态后才重新显示。
+    val idle = if (mode == HomeChatMode.TEXT) ts.messages.isEmpty()
+    else !cs.inCall && cs.turns.isEmpty()
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-    ) {
-        HomeTopBar(onSettingsClick = onSettingsClick)
-
-        if (hasConversation) {
-            AgentStrip(
-                agents = agents,
-                onAgentClick = onAgentClick,
-                modifier = Modifier.padding(top = 6.dp)
-            )
-        } else {
-            AgentGrid(
-                agents = agents,
-                onAgentClick = onAgentClick,
-                modifier = Modifier.padding(top = 12.dp)
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            AppDrawer(
+                sessions = sessions,
+                currentId = textVm.currentSessionId,
+                onNewTask = {
+                    scope.launch { drawerState.close() }
+                    startNewTask(HomeChatMode.TEXT)
+                },
+                onOpenSession = { id ->
+                    textVm.openSession(id)
+                    switchTo(HomeChatMode.TEXT)
+                    scope.launch { drawerState.close() }
+                },
+                onDeleteSession = textVm::deleteSession,
+                onSettings = {
+                    scope.launch { drawerState.close() }
+                    onSettingsClick()
+                }
             )
         }
-
-        ModeTabs(
-            mode = mode,
-            onModeChange = { m ->
-                if (m != mode) {
-                    // 两种模式都要用麦克风 / LLM 推理同时只能服务一路，切换前先把另一路停下来
-                    if (m == HomeChatMode.VOICE) {
-                        focusManager.clearFocus()
-                        if (ts.generating) textVm.stop()
-                    } else {
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+        ) {
+            HomeTopBar(
+                onMenuClick = { scope.launch { drawerState.open() } },
+                // 电话图标：激活 / 退出语音通话模式（豆包式入口），设置齿轮在它右边
+                onCallClick = {
+                    focusManager.clearFocus()
+                    if (mode == HomeChatMode.VOICE) {
                         callVm.hangUp()
+                        mode = HomeChatMode.TEXT
+                    } else {
+                        switchTo(HomeChatMode.VOICE)
                     }
-                    mode = m
-                }
-            },
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
-        )
+                },
+                callActive = mode == HomeChatMode.VOICE,
+                onSettingsClick = onSettingsClick
+            )
 
-        if (mode == HomeChatMode.TEXT) {
-            ts.error?.let { err -> ErrorBanner(text = err, onDismiss = textVm::dismissError) }
-            if (ts.preparing) {
-                PreparingRow(ts.preparingText, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+            if (idle) {
+                AgentGrid(
+                    agents = agents,
+                    onAgentClick = onAgentClick,
+                    modifier = Modifier.padding(top = 12.dp)
+                )
             }
-            if (ts.messages.isNotEmpty()) {
-                ChatToolbar(
-                    mode = ts.thinkMode,
-                    onMode = textVm::setThinkMode,
-                    canClear = !ts.generating,
-                    onClear = textVm::clearChat,
-                    onHistory = { showHistory = true },
+
+            if (mode == HomeChatMode.TEXT) {
+                ts.error?.let { err -> ErrorBanner(text = err, onDismiss = textVm::dismissError) }
+                if (ts.preparing) {
+                    PreparingRow(ts.preparingText, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+                }
+            } else {
+                cs.error?.let { err -> CallErrorBanner(text = err, onDismiss = callVm::dismissError) }
+            }
+
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                if (mode == HomeChatMode.TEXT) {
+                    if (ts.messages.isEmpty()) {
+                        ChatEmptyState(onPick = { textVm.setInput(it) })
+                    } else {
+                        LazyColumn(
+                            state = chatList,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            items(ts.messages, key = { it.id }) { m ->
+                                ChatBubble(
+                                    msg = m,
+                                    accent = AgentBlue,
+                                    // 精致模式的 thinking 里装的是执行方案，不是模型的 <think> 推理链
+                                    planDoing = "生成执行方案中…",
+                                    planDone = "已生成执行方案"
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        CallStage(
+                            phase = cs.phase,
+                            inCall = cs.inCall,
+                            startedAtMs = cs.startedAtMs,
+                            preparing = cs.preparing,
+                            preparingText = cs.preparingText,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        if (cs.turns.isEmpty()) {
+                            CallHint(ttsReady = cs.ttsReady, modifier = Modifier.weight(1f))
+                        } else {
+                            LazyColumn(
+                                state = callList,
+                                modifier = Modifier.weight(1f).fillMaxWidth(),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                items(cs.turns, key = { it.id }) { t -> CallTurnRow(t) }
+                                item { Spacer(Modifier.height(4.dp)) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 语音输入自身的错误提示（权限被拒 / 没听清 / 识别失败），5 秒后自动消失
+            voiceError?.let { err ->
+                ErrorBanner(text = err, onDismiss = { voiceError = null })
+            }
+
+            // 语音输入过程中的状态条（录音中 / 识别中）
+            if (voicePhase != VoiceInputPhase.IDLE) {
+                VoiceInputBar(
+                    phase = voicePhase,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
                 )
             }
-        } else {
-            cs.error?.let { err -> CallErrorBanner(text = err, onDismiss = callVm::dismissError) }
-        }
 
-        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            // 底部两个控件各自处理导航栏/输入法内边距，外层不再重复加
             if (mode == HomeChatMode.TEXT) {
-                if (ts.messages.isEmpty()) {
-                    ChatEmptyState(onPick = { textVm.setInput(it) })
-                } else {
-                    LazyColumn(
-                        state = chatList,
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        items(ts.messages, key = { it.id }) { m ->
-                            ChatBubble(msg = m, accent = AgentBlue)
-                        }
-                    }
-                }
+                ChatInputBar(
+                    value = ts.input,
+                    onValue = textVm::setInput,
+                    generating = ts.generating,
+                    docName = ts.docName,
+                    docChars = ts.docChars,
+                    onRemoveDoc = textVm::removeDoc,
+                    onPickDoc = { runCatching { pickLauncher.launch(pickMimes) } },
+                    onSend = { focusManager.clearFocus(); textVm.send() },
+                    onStop = textVm::stop,
+                    thinkMode = ts.thinkMode,
+                    onThinkMode = textVm::setThinkMode,
+                    showMic = true,
+                    micModifier = micGesture,
+                    micActive = voicePhase == VoiceInputPhase.RECORDING
+                )
             } else {
-                Column(modifier = Modifier.fillMaxSize()) {
-                    CallStage(
-                        phase = cs.phase,
-                        inCall = cs.inCall,
-                        startedAtMs = cs.startedAtMs,
-                        preparing = cs.preparing,
-                        preparingText = cs.preparingText,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (cs.turns.isEmpty()) {
-                        CallHint(ttsReady = cs.ttsReady, modifier = Modifier.weight(1f))
-                    } else {
-                        LazyColumn(
-                            state = callList,
-                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            items(cs.turns, key = { it.id }) { t -> CallTurnRow(t) }
-                            item { Spacer(Modifier.height(4.dp)) }
-                        }
-                    }
-                }
+                CallControls(
+                    inCall = cs.inCall,
+                    onStart = { requestCall() },
+                    onHangUp = callVm::hangUp,
+                    voices = cs.voices,
+                    voiceIndex = cs.voiceIndex,
+                    onPickVoice = callVm::setVoice
+                )
             }
         }
-
-        // 底部两个控件各自处理导航栏/输入法内边距，外层不再重复加
-        if (mode == HomeChatMode.TEXT) {
-            ChatInputBar(
-                value = ts.input,
-                onValue = textVm::setInput,
-                generating = ts.generating,
-                docName = ts.docName,
-                docChars = ts.docChars,
-                onRemoveDoc = textVm::removeDoc,
-                onPickDoc = { runCatching { pickLauncher.launch(pickMimes) } },
-                onSend = { focusManager.clearFocus(); textVm.send() },
-                onStop = textVm::stop
-            )
-        } else {
-            CallControls(
-                inCall = cs.inCall,
-                onStart = { requestCall() },
-                onHangUp = callVm::hangUp,
-                voices = cs.voices,
-                voiceIndex = cs.voiceIndex,
-                onPickVoice = callVm::setVoice
-            )
-        }
-    }
-
-    if (showHistory) {
-        HistorySheet(
-            sessions = sessions,
-            currentId = textVm.currentSessionId,
-            onOpen = textVm::openSession,
-            onDelete = textVm::deleteSession,
-            onNew = textVm::clearChat,
-            onDismiss = { showHistory = false }
-        )
     }
 }
 
-// ── 顶部应用栏 ──
+// ── 语音输入状态条 ──
 @Composable
-private fun HomeTopBar(onSettingsClick: () -> Unit) {
+private fun VoiceInputBar(phase: VoiceInputPhase, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(AgentRose.copy(alpha = 0.10f))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (phase == VoiceInputPhase.RECORDING) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFFDC2626))
+            )
+            Text(
+                text = "正在说话…松开手指即发送，手指滑开可取消",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f)
+            )
+        } else {
+            CircularProgressIndicator(
+                modifier = Modifier.size(13.dp),
+                strokeWidth = 2.dp,
+                color = AgentRose
+            )
+            Text(
+                text = "正在识别…首次使用需要加载语音识别模型，请稍候",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f)
+            )
+        }
+    }
+}
+// ── 左侧抽屉：新建任务 + 历史记录 ──
+@Composable
+private fun AppDrawer(
+    sessions: List<ChatSession>,
+    currentId: String?,
+    onNewTask: () -> Unit,
+    onOpenSession: (String) -> Unit,
+    onDeleteSession: (String) -> Unit,
+    onSettings: () -> Unit
+) {
+    // 抽屉宽度 = 屏宽的 80%，高度充满（ModalDrawerSheet 默认只给 360dp）
+    val drawerWidth = LocalConfiguration.current.screenWidthDp.dp * 0.8f
+    ModalDrawerSheet(
+        modifier = Modifier.fillMaxHeight().width(drawerWidth),
+        drawerShape = RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxHeight()
+                .padding(vertical = 8.dp)
+        ) {
+            // ── 头部 ──
+            Row(
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            Brush.linearGradient(
+                                listOf(AgentPurple, lerp(AgentPurple, Color.White, 0.25f))
+                            )
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AutoAwesome,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(11.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "端侧离线工作搭子",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "全程离线 · 数据不出设备",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // ── 新建任务 ──
+            Button(
+                onClick = onNewTask,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Add,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("新建任务", style = MaterialTheme.typography.labelLarge)
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // ── 历史记录 ──
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "历史记录",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
+                )
+                if (sessions.isNotEmpty()) {
+                    Text(
+                        text = "${sessions.size} 条",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            if (sessions.isEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp),
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = "还没有历史会话",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "点上面的「新建任务」开始第一段对话，结束后会自动存到这里。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                        lineHeight = 17.sp
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    items(sessions, key = { it.id }) { s ->
+                        SessionRow(
+                            session = s,
+                            selected = s.id == currentId,
+                            onClick = { onOpenSession(s.id) },
+                            onDelete = { onDeleteSession(s.id) }
+                        )
+                    }
+                    item { Spacer(modifier = Modifier.height(8.dp)) }
+                }
+            }
+
+            HorizontalDivider(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+            )
+            NavigationDrawerItem(
+                label = { Text("设置", style = MaterialTheme.typography.labelLarge) },
+                icon = {
+                    Icon(
+                        imageVector = Icons.Default.Settings,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                },
+                selected = false,
+                onClick = onSettings,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.padding(horizontal = 12.dp)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+    }
+}
+
+/** 抽屉里的一条历史会话：标题 + 时间条数，右侧删除。 */
+@Composable
+private fun SessionRow(
+    session: ChatSession,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(
+                if (selected) MaterialTheme.colorScheme.secondaryContainer
+                else Color.Transparent
+            )
+            .clickable(onClick = onClick)
+            .padding(start = 12.dp, end = 4.dp, top = 9.dp, bottom = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Icon(
+            imageVector = Icons.AutoMirrored.Filled.Chat,
+            contentDescription = null,
+            tint = if (selected) MaterialTheme.colorScheme.onSecondaryContainer
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(17.dp)
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = session.title.ifBlank { "未命名会话" },
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                color = if (selected) MaterialTheme.colorScheme.onSecondaryContainer
+                else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "${formatSessionTime(session.updatedAt)} · ${session.messages.size} 条",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        IconButton(onClick = onDelete, modifier = Modifier.size(34.dp)) {
+            Icon(
+                imageVector = Icons.Default.DeleteOutline,
+                contentDescription = "删除会话",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(17.dp)
+            )
+        }
+    }
+}
+
+private fun formatSessionTime(ms: Long): String =
+    SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(ms))
+// ── 顶部应用栏 ──
+/**
+ * 顶部应用栏：左侧汉堡键拉开抽屉（历史 / 新建任务），右侧是语音通话开关与设置。
+ * 电话图标亮起表示处于语音通话模式，再点一次挂断并回到文本对话（豆包式入口）。
+ */
+@Composable
+private fun HomeTopBar(
+    onMenuClick: () -> Unit,
+    onCallClick: () -> Unit,
+    callActive: Boolean,
+    onSettingsClick: () -> Unit
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .windowInsetsPadding(WindowInsets.statusBars)
-            .padding(start = 20.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
+            .padding(start = 8.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(
-            modifier = Modifier
-                .size(34.dp)
-                .clip(RoundedCornerShape(11.dp))
-                .background(Brush.linearGradient(listOf(AgentPurple, lerp(AgentPurple, Color.White, 0.25f)))),
-            contentAlignment = Alignment.Center
-        ) {
+        IconButton(onClick = onMenuClick) {
             Icon(
-                imageVector = Icons.Default.AutoAwesome,
-                contentDescription = null,
-                tint = Color.White,
-                modifier = Modifier.size(19.dp)
+                imageVector = Icons.Default.Menu,
+                contentDescription = "打开侧边栏",
+                tint = MaterialTheme.colorScheme.onBackground
             )
         }
-        Spacer(modifier = Modifier.width(10.dp))
+        Spacer(modifier = Modifier.width(4.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = "端侧离线工作搭子",
@@ -348,6 +793,13 @@ private fun HomeTopBar(onSettingsClick: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+        IconButton(onClick = onCallClick) {
+            Icon(
+                imageVector = Icons.Default.Call,
+                contentDescription = if (callActive) "退出语音通话" else "语音通话",
+                tint = if (callActive) AgentRose else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
         IconButton(onClick = onSettingsClick) {
             Icon(
                 imageVector = Icons.Default.Settings,
@@ -358,59 +810,6 @@ private fun HomeTopBar(onSettingsClick: () -> Unit) {
     }
 }
 
-// ── 模式切换（分段控件） ──
-@Composable
-private fun ModeTabs(
-    mode: HomeChatMode,
-    onModeChange: (HomeChatMode) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(40.dp)
-            .clip(RoundedCornerShape(20.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
-            .padding(4.dp)
-    ) {
-        HomeChatMode.values().forEach { m ->
-            val selected = m == mode
-            val accent = if (m == HomeChatMode.TEXT) AgentBlue else AgentRose
-            val contentColor = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(
-                        if (selected) Brush.linearGradient(listOf(accent, lerp(accent, Color.White, 0.22f)))
-                        else Brush.linearGradient(listOf(Color.Transparent, Color.Transparent))
-                    )
-                    .clickable { onModeChange(m) },
-                contentAlignment = Alignment.Center
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Icon(
-                        imageVector = if (m == HomeChatMode.TEXT) Icons.AutoMirrored.Filled.Chat
-                        else Icons.Default.Call,
-                        contentDescription = null,
-                        tint = contentColor,
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Text(
-                        text = m.label,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                        color = contentColor
-                    )
-                }
-            }
-        }
-    }
-}
 
 // ── 智能体宫格（未开始对话时展示，位于对话框上方） ──
 // 整块保持紧凑：分区标题压成一行小字，卡片只留图标 + 单行名字
@@ -509,71 +908,4 @@ private fun AgentMiniCard(
     }
 }
 
-// ── 对话进行中：智能体折叠成横向滑动条 ──
-@Composable
-private fun AgentStrip(
-    agents: List<FunctionItem>,
-    onAgentClick: (String) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Column(modifier = modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.padding(horizontal = 20.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "更多智能体",
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.weight(1f)
-            )
-            Text(
-                text = "横向滑动查看全部",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        Spacer(modifier = Modifier.height(5.dp))
-        LazyRow(
-            contentPadding = PaddingValues(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            items(agents, key = { it.id }) { item ->
-                AgentChip(item = item, onClick = { onAgentClick(item.route) })
-            }
-        }
-    }
-}
 
-@Composable
-private fun AgentChip(item: FunctionItem, onClick: () -> Unit) {
-    val enabled = !item.isComingSoon
-    val alpha = if (enabled) 1f else 0.45f
-    val shape = RoundedCornerShape(12.dp)
-    Row(
-        modifier = Modifier
-            .clip(shape)
-            .background(MaterialTheme.colorScheme.surface)
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f), shape)
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 9.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(5.dp)
-    ) {
-        Icon(
-            imageVector = item.icon,
-            contentDescription = null,
-            tint = item.accent.copy(alpha = alpha),
-            modifier = Modifier.size(14.dp)
-        )
-        Text(
-            text = item.title.removeSuffix("智能体"),
-            style = MaterialTheme.typography.labelMedium.copy(fontSize = 11.sp),
-            fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = alpha),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-    }
-}

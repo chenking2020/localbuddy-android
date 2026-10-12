@@ -13,6 +13,7 @@ import org.json.JSONObject
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -42,11 +43,18 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.*
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -60,14 +68,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
@@ -96,12 +107,17 @@ import kotlin.math.max
 // 文本对话智能体
 // ──────────────────────────────────────────────────────────────────
 
-/** 推理模式。Qwen3 是混合思考模型，两种模式走同一套权重、由 prompt 里的思考块开关切换。 */
+/**
+ * 推理模式。两种模式走同一套权重，差别在「是否先规划」。
+ *
+ * - 快速模式：单次推理直接出正文，响应快，适合闲聊 / 简单问答。
+ * - 精致模式：先生成一份极简执行方案，再按方案逐条展开作答（见 [TextChatViewModel.send]）。
+ *   这是 WorkBuddy「先规划再执行」在端侧 0.6B 上的简要实现：模型太小，撑不起完整的
+ *   多步工具编排，只取其骨架——先想清楚要点，再照着要点作答。
+ */
 enum class ThinkMode(val label: String, val hint: String) {
-    /** 不思考：assistant 开头注入空思考块，模型直接出正文。快，适合闲聊/简单问答。 */
-    FAST("不思考", "直接作答，响应更快"),
-    /** 深度思考：让模型先输出 <think> 推理链再作答。慢，适合推理/计算/复杂问题。 */
-    DEEP("深度思考", "先推理再作答，复杂问题更准")
+    FAST("快速模式", "直接作答，响应更快"),
+    DEEP("精致模式", "先出执行方案，再逐条作答")
 }
 
 /** 一条对话气泡。 */
@@ -215,7 +231,25 @@ private const val CHAT_HISTORY_TURNS = 6
 private const val DOC_EXCERPT_TOKENS = 420
 
 private const val MAX_NEW_FAST = 320
-private const val MAX_NEW_DEEP = 640
+
+/** 精致模式 · 方案阶段：只产出要点，够用即可，别把 token 预算吃光。 */
+private const val MAX_NEW_PLAN = 96
+
+/** 精致模式 · 作答阶段：比快速模式更长，要按方案逐条展开。 */
+private const val MAX_NEW_REFINE = 512
+
+/**
+ * 精致模式的方案阶段提示词：只要要点，不要解释。
+ *
+ * 端侧 0.6B 的长文本生成容易跑偏，所以这里把输出收紧到「2-4 条、每条 15 字内」的要点列表，
+ * 既降低生成负担，也让第二步有明确的条目可以逐条覆盖。
+ */
+private const val PLAN_SYSTEM =
+    "你是端侧离线助手的「方案规划」模块。针对用户的问题，先给出一份极简的执行方案。要求：\n" +
+        "1. 只列 2-4 条要点，每条不超过 15 个字；\n" +
+        "2. 每行一条，行首用「- 」，不要写编号以外的任何说明；\n" +
+        "3. 不要复述用户的问题，不要客套，不要解释为什么要这么做；\n" +
+        "4. 使用与用户提问相同的语言。"
 
 class TextChatViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -383,7 +417,7 @@ class TextChatViewModel(app: Application) : AndroidViewModel(app) {
     fun send() {
         val q = _state.value.input.trim()
         if (q.isBlank() || _state.value.generating) return
-        val deep = _state.value.thinkMode == ThinkMode.DEEP
+        val refined = _state.value.thinkMode == ThinkMode.DEEP
         val llm = LlmEngine.get(getApplication<Application>())
 
         val userMsg = ChatMessage(idSeq++, ROLE_USER, q)
@@ -409,16 +443,31 @@ class TextChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 // 文档问答：按问题从全文里检索最相关的句子，只把摘录塞进 prompt
                 val userContent = buildUserContent(q, doc, docName)
+
+                // ── 精致模式：第一段先出执行方案，第二段按方案作答 ──
+                // 方案写进 thinking 字段，复用气泡里那块可折叠区域展示（生成中展开、正文一出自动收起）。
+                val plan = if (refined) {
+                    val raw = llm.generate(
+                        user = userContent,
+                        system = PLAN_SYSTEM,
+                        maxNew = MAX_NEW_PLAN,
+                        enableThinking = false,
+                        onPartial = { t -> patch(ansId) { it.copy(thinking = t) } }
+                    )
+                    val p = raw.trim()
+                    patch(ansId) { it.copy(thinking = p) }
+                    p
+                } else ""
+
                 val turns = buildList {
-                    add(ChatTurn(ROLE_SYSTEM, buildSystem(docName, doc.length)))
+                    add(ChatTurn(ROLE_SYSTEM, buildSystem(docName, doc.length, plan)))
                     history.forEach { add(it) }
                     add(ChatTurn(ROLE_USER, userContent))
                 }
                 val answer = llm.chat(
                     messages = turns,
-                    maxNew = if (deep) MAX_NEW_DEEP else MAX_NEW_FAST,
-                    enableThinking = deep,
-                    onThink = { t -> patch(ansId) { it.copy(thinking = t) } },
+                    maxNew = if (refined) MAX_NEW_REFINE else MAX_NEW_FAST,
+                    enableThinking = false,
                     onPartial = { p -> patch(ansId) { it.copy(text = p) } }
                 )
                 // 中途被「停止」：保留已生成的部分内容，不要拿空串覆盖掉它
@@ -463,17 +512,26 @@ class TextChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun buildSystem(docName: String?, docLen: Int): String =
-        "你是「端侧离线工作搭子」内置的文本对话助手，运行在用户手机本地、全程离线。要求：\n" +
+    /**
+     * @param plan 精致模式生成的执行方案；非空时要求模型按方案逐条展开。
+     *             方案为空（生成失败 / 模型不配合）时自动退化成普通作答，不至于卡住。
+     */
+    private fun buildSystem(docName: String?, docLen: Int, plan: String? = null): String {
+        val core = "你是「端侧离线工作搭子」内置的文本对话助手，运行在用户手机本地、全程离线。要求：\n" +
             "1. 直接回答用户的问题，不要复述问题，不要加“好的”“以下是”之类客套前缀；\n" +
             "2. 回答简洁清晰，要点多时用列表分条，不要写长篇套话；\n" +
             "3. 使用与用户提问相同的语言回答；\n" +
-            "4. 不确定的信息要说明不确定，不要编造事实；\n" +
-            if (docName != null)
-                "5. 用户已上传文档《$docName》（共 $docLen 字）。" +
-                    "回答与该文档相关的问题时，只依据用户消息里给出的文档摘录作答；" +
-                    "摘录中没有的信息，明确说明文档未提及，不要臆测。\n"
-            else ""
+            "4. 不确定的信息要说明不确定，不要编造事实；\n"
+        val docPart = if (docName != null)
+            "5. 用户已上传文档《$docName》（共 $docLen 字）。" +
+                "回答与该文档相关的问题时，只依据用户消息里给出的文档摘录作答；" +
+                "摘录中没有的信息，明确说明文档未提及，不要臆测。\n"
+        else ""
+        val planPart = if (!plan.isNullOrBlank())
+            "本次回答请严格按下面这份执行方案逐条展开，不要遗漏任何一条：\n$plan\n"
+        else ""
+        return core + docPart + planPart
+    }
 
     private suspend fun buildUserContent(q: String, doc: String, docName: String?): String =
         withContext(Dispatchers.Default) {
@@ -590,9 +648,8 @@ fun TextChatScreen(onBack: () -> Unit, vm: TextChatViewModel = viewModel()) {
             )
 
             ChatToolbar(
-                mode = s.thinkMode,
-                onMode = vm::setThinkMode,
                 canClear = s.messages.isNotEmpty() && !s.generating,
+                onNew = vm::clearChat,
                 onClear = vm::clearChat,
                 onHistory = { showHistory = true },
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
@@ -633,7 +690,9 @@ fun TextChatScreen(onBack: () -> Unit, vm: TextChatViewModel = viewModel()) {
                 onRemoveDoc = vm::removeDoc,
                 onPickDoc = { runCatching { pickLauncher.launch(pickMimes) } },
                 onSend = { focusManager.clearFocus(); vm.send() },
-                onStop = vm::stop
+                onStop = vm::stop,
+                thinkMode = s.thinkMode,
+                onThinkMode = vm::setThinkMode
             )
         }
     }
@@ -704,52 +763,59 @@ internal data class BottomSnap(
 
 /** 推理模式切换 + 清空会话。做成一条与背景同色的圆角工具栏，弱化到不抢消息区的注意力。 */
 @Composable
+/**
+ * 会话操作栏。模式切换已挪到输入区上方（点击输入框后展开），这里只留会话本身的操作。
+ * @param canClear 当前会话是否有内容；空会话时「新建 / 清空」置灰，但「历史」始终可用。
+ */
 internal fun ChatToolbar(
-    mode: ThinkMode,
-    onMode: (ThinkMode) -> Unit,
     canClear: Boolean,
+    onNew: () -> Unit,
     onClear: () -> Unit,
     onHistory: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        ThinkModeSwitch(mode = mode, onMode = onMode)
         Spacer(Modifier.weight(1f))
-        HistoryButton(onClick = onHistory)
-        // 只在有内容时显示：空会话里放一个无效按钮反而像故障
-        if (canClear) {
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .clickable(onClick = onClear)
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Icon(Icons.Default.Close, null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(15.dp))
-                Text("清空会话", style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
+        ToolbarTextButton(
+            icon = Icons.Default.Add,
+            label = "新建对话",
+            enabled = canClear,
+            onClick = onNew
+        )
+        ToolbarTextButton(
+            icon = Icons.Default.History,
+            label = "历史",
+            onClick = onHistory
+        )
+        ToolbarTextButton(
+            icon = Icons.Default.Close,
+            label = "清空会话",
+            enabled = canClear,
+            onClick = onClear
+        )
     }
 }
 
-/** 「历史」入口：回看/继续之前的会话。常驻显示，空会话时也能翻旧账。 */
+/** 工具栏里「图标 + 文字」的小按钮，禁用时整体变淡且不响应点击。 */
 @Composable
-private fun HistoryButton(onClick: () -> Unit) {
+private fun ToolbarTextButton(
+    icon: ImageVector,
+    label: String,
+    enabled: Boolean = true,
+    onClick: () -> Unit
+) {
+    val tint = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
+    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-        Icon(Icons.Default.History, null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(15.dp))
-        Text("历史", style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(15.dp))
+        Text(label, style = MaterialTheme.typography.labelSmall, color = tint)
     }
 }
 
@@ -847,58 +913,15 @@ private fun HistoryRow(
 private fun fmtTime(ms: Long): String =
     SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(ms))
 
-@Composable
-private fun ThinkModeSwitch(mode: ThinkMode, onMode: (ThinkMode) -> Unit) {
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
-            .padding(3.dp)
-    ) {
-        ThinkModeChip(
-            icon = Icons.Default.Bolt, label = ThinkMode.FAST.label,
-            selected = mode == ThinkMode.FAST, onClick = { onMode(ThinkMode.FAST) }
-        )
-        ThinkModeChip(
-            icon = Icons.Default.Psychology, label = ThinkMode.DEEP.label,
-            selected = mode == ThinkMode.DEEP, onClick = { onMode(ThinkMode.DEEP) }
-        )
-    }
-}
-
-@Composable
-private fun ThinkModeChip(
-    icon: ImageVector,
-    label: String,
-    selected: Boolean,
-    onClick: () -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(11.dp))
-            .background(if (selected) AgentBlue else Color.Transparent)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 13.dp, vertical = 7.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(5.dp)
-    ) {
-        Icon(
-            icon, null,
-            tint = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(15.dp)
-        )
-        Text(
-            label,
-            style = MaterialTheme.typography.labelMedium,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-            color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-}
-
 /** 单条气泡。用户：主题色实心 + 白字；助手：浅底 + 可折叠的思考过程。 */
 @Composable
-internal fun ChatBubble(msg: ChatMessage, accent: Color) {
+internal fun ChatBubble(
+    msg: ChatMessage,
+    accent: Color,
+    /** 思考/方案区进行中与完成时的标题文案。 */
+    planDoing: String = "深度思考中…",
+    planDone: String = "已深度思考"
+) {
     val isUser = msg.role == ROLE_USER
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -912,7 +935,7 @@ internal fun ChatBubble(msg: ChatMessage, accent: Color) {
         // 气泡最宽占 84%：留出对手侧的一列空白，长对话里左右分区才清楚
         Column(modifier = Modifier.fillMaxWidth(0.84f), horizontalAlignment = if (isUser) Alignment.End else Alignment.Start) {
             if (msg.thinking.isNotBlank()) {
-                ThinkBlock(msg = msg, accent = accent)
+                ThinkBlock(msg = msg, accent = accent, doingLabel = planDoing, doneLabel = planDone)
                 Spacer(Modifier.height(6.dp))
             }
             if (msg.text.isNotBlank()) {
@@ -1011,7 +1034,12 @@ internal fun ChatBubbleShape(isUser: Boolean) = RoundedCornerShape(
  * 让答案回到视觉中心；之后用户可点击标题手动展开/收起。
  */
 @Composable
-internal fun ThinkBlock(msg: ChatMessage, accent: Color) {
+internal fun ThinkBlock(
+    msg: ChatMessage,
+    accent: Color,
+    doingLabel: String = "深度思考中…",
+    doneLabel: String = "已深度思考"
+) {
     var expanded by remember(msg.id) { mutableStateOf(true) }
     LaunchedEffect(msg.streaming, msg.text.isNotBlank()) {
         if (!msg.streaming || msg.text.isNotBlank()) expanded = false
@@ -1038,7 +1066,7 @@ internal fun ThinkBlock(msg: ChatMessage, accent: Color) {
                 tint = accent, modifier = Modifier.size(15.dp)
             )
             Text(
-                if (thinking) "深度思考中…" else "已深度思考",
+                if (thinking) doingLabel else doneLabel,
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = accent,
@@ -1220,6 +1248,12 @@ internal fun SuggestionCard(
  * 被遮住；同时 manifest 里配了 `adjustResize`，输入法高度才能正确进入 WindowInsets.ime。
  */
 @Composable
+/**
+ * 豆包式输入卡片：
+ * - 未聚焦时是紧凑单行（输入框 + 语音 + 发送）；
+ * - 点击聚焦后展开成大卡片：上面是多行输入区（高度变大），下面一行操作按钮——
+ *   语音（按住说话）、⚡快速/精致选择、+（上传文档）、圆形发送键。
+ */
 internal fun ChatInputBar(
     value: String,
     onValue: (String) -> Unit,
@@ -1229,11 +1263,34 @@ internal fun ChatInputBar(
     onRemoveDoc: () -> Unit,
     onPickDoc: () -> Unit,
     onSend: () -> Unit,
-    onStop: () -> Unit
+    onStop: () -> Unit,
+    /** 快速 / 精致模式：非空时在展开态的操作行里显示选择器。 */
+    thinkMode: ThinkMode? = null,
+    onThinkMode: ((ThinkMode) -> Unit)? = null,
+    /** 输入框焦点变化回调（展开/收起也由这里驱动）。 */
+    onFocusChange: (Boolean) -> Unit = {},
+    /** 是否显示语音输入按钮（按住说话、松开发送）。 */
+    showMic: Boolean = false,
+    /** 语音按钮的手势 modifier：首页用长按手势，不能是普通 clickable。 */
+    micModifier: Modifier = Modifier,
+    /** 正在录音：按钮转为按下态。 */
+    micActive: Boolean = false
 ) {
     val navBar = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val ime = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
     val bottomPad = max(navBar.value, ime.value).dp
+
+    var focused by remember { mutableStateOf(false) }
+    var modeMenuOpen by remember { mutableStateOf(false) }
+    // 聚焦后展开：输入区变高、操作行换到下面一行
+    val expanded = focused
+    val inputMinHeight by animateDpAsState(
+        targetValue = if (expanded) 116.dp else 44.dp,
+        animationSpec = tween(durationMillis = 180),
+        label = "inputMinHeight"
+    )
+
+    val canSend = value.isNotBlank() && !generating
 
     Surface(tonalElevation = 3.dp, shadowElevation = 8.dp, color = MaterialTheme.colorScheme.surface) {
         Column(
@@ -1242,132 +1299,242 @@ internal fun ChatInputBar(
                 .padding(start = 14.dp, end = 14.dp, top = 10.dp)
                 .padding(bottom = bottomPad + 12.dp)
         ) {
-            // 已附加的文档：只在这里回显，不再单独放一个「上传文档用于问答」按钮
-            if (docName != null) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(AgentBlue.copy(alpha = 0.09f))
-                        .padding(horizontal = 11.dp, vertical = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Default.Description, null, tint = AgentBlue, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(7.dp))
-                    Text(
-                        docName,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        maxLines = 1,
-                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
+            // ── 输入卡片：大圆角、描边 ──
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(28.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .border(
+                        1.dp,
+                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
+                        RoundedCornerShape(28.dp)
                     )
-                    Text(" · ${docChars} 字", style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.width(4.dp))
-                    Box(
+            ) {
+                // 已附加的文档：在卡片内顶部回显
+                if (docName != null) {
+                    Row(
                         modifier = Modifier
-                            .size(22.dp)
-                            .clip(CircleShape)
-                            .clickable(onClick = onRemoveDoc),
-                        contentAlignment = Alignment.Center
+                            .padding(start = 14.dp, end = 14.dp, top = 12.dp)
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(AgentBlue.copy(alpha = 0.09f))
+                            .padding(horizontal = 11.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Close, "移除文档",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(14.dp))
+                        Icon(Icons.Default.Description, null, tint = AgentBlue, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(7.dp))
+                        Text(
+                            docName,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        Text(" · ${docChars} 字", style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(4.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clip(CircleShape)
+                                .clickable(onClick = onRemoveDoc),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Default.Close, "移除文档",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(14.dp))
+                        }
                     }
                 }
-                Spacer(Modifier.height(8.dp))
-            }
 
-            Row(verticalAlignment = Alignment.Bottom) {
-                Box(
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
-                        .clickable(onClick = onPickDoc),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        Icons.Default.AttachFile, "上传文档",
-                        tint = if (docName != null) AgentBlue else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
-                Spacer(Modifier.width(8.dp))
-                // 输入框本体是这颗胶囊：TextField 容器置透明，边框也去掉，
-                // 靠外层 surfaceVariant 背景勾形，比描边款更干净
-                OutlinedTextField(
+                // ── 输入区 ──
+                BasicTextField(
                     value = value,
                     onValueChange = onValue,
-                    modifier = Modifier.weight(1f),
-                    placeholder = {
-                        Text(
-                            if (docName != null) "针对文档提问…" else "输入你的问题…",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    },
-                    shape = RoundedCornerShape(22.dp),
-                    maxLines = 5,
-                    textStyle = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = inputMinHeight)
+                        .onFocusChanged {
+                            focused = it.isFocused
+                            onFocusChange(it.isFocused)
+                        },
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(
+                        color = MaterialTheme.colorScheme.onSurface
+                    ),
+                    cursorBrush = SolidColor(AgentBlue),
+                    maxLines = 8,
                     keyboardOptions = KeyboardOptions(
                         capitalization = KeyboardCapitalization.Sentences,
                         imeAction = ImeAction.Send
                     ),
                     keyboardActions = KeyboardActions(
-                        onSend = { if (value.isNotBlank() && !generating) onSend() }
+                        onSend = { if (canSend) onSend() }
                     ),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
-                        unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-                        focusedBorderColor = AgentBlue.copy(alpha = 0.45f),
-                        unfocusedBorderColor = Color.Transparent,
-                        cursorColor = AgentBlue,
-                        focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                        unfocusedTextColor = MaterialTheme.colorScheme.onSurface
-                    )
-                )
-                Spacer(Modifier.width(8.dp))
-                val canSend = value.isNotBlank() && !generating
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(CircleShape)
-                        // 三个分支统一成 Brush：混用 Color 会让 if 表达式退化成 Any，background 无重载可匹配
-                        .background(
-                            when {
-                                generating -> Brush.linearGradient(
-                                    listOf(
-                                        MaterialTheme.colorScheme.errorContainer,
-                                        MaterialTheme.colorScheme.errorContainer
-                                    )
-                                )
-                                canSend -> Brush.linearGradient(
-                                    listOf(AgentBlue, lerp(AgentBlue, Color.White, 0.22f))
-                                )
-                                else -> Brush.linearGradient(
-                                    listOf(
-                                        MaterialTheme.colorScheme.surfaceVariant,
-                                        MaterialTheme.colorScheme.surfaceVariant
-                                    )
+                    decorationBox = { inner ->
+                        Box(
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                            contentAlignment = if (expanded) Alignment.TopStart else Alignment.CenterStart
+                        ) {
+                            if (value.isEmpty()) {
+                                Text(
+                                    if (docName != null) "针对文档提问…" else "发消息…",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                        )
-                        .clickable { if (generating) onStop() else if (canSend) onSend() },
-                    contentAlignment = Alignment.Center
+                            inner()
+                        }
+                    }
+                )
+
+                // ── 操作行 ──
+                Row(
+                    modifier = Modifier.padding(start = 10.dp, end = 12.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        if (generating) Icons.Default.Stop else Icons.AutoMirrored.Filled.Send,
-                        contentDescription = if (generating) "停止生成" else "发送",
-                        tint = when {
-                            generating -> MaterialTheme.colorScheme.onErrorContainer
-                            canSend -> Color.White
-                            else -> MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                        modifier = Modifier.size(21.dp)
-                    )
+                    // 语音输入：按住说话、松开发送
+                    if (showMic) {
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .scale(if (micActive) 1.14f else 1f)
+                                .clip(CircleShape)
+                                .background(
+                                    if (micActive) Color(0xFFDC2626) else Color.Transparent
+                                )
+                                .then(micModifier),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Mic,
+                                contentDescription = "按住说话",
+                                tint = if (micActive) Color.White
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(21.dp)
+                            )
+                        }
+                    }
+
+                    // 快速 / 精致模式：⚡快速 ∨，点击弹出选择
+                    if (thinkMode != null && onThinkMode != null) {
+                        Box {
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(18.dp))
+                                    .clickable { modeMenuOpen = true }
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (thinkMode == ThinkMode.DEEP) Icons.Default.Psychology
+                                    else Icons.Default.Bolt,
+                                    contentDescription = null,
+                                    tint = if (thinkMode == ThinkMode.DEEP) AgentPurple else AgentBlue,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = thinkMode.label,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.ArrowDropDown,
+                                    contentDescription = "切换模式",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = modeMenuOpen,
+                                onDismissRequest = { modeMenuOpen = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("快速 · 直接回答") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Bolt, null, tint = AgentBlue, modifier = Modifier.size(18.dp))
+                                    },
+                                    onClick = {
+                                        onThinkMode(ThinkMode.FAST)
+                                        modeMenuOpen = false
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("精致 · 深度思考") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Psychology, null, tint = AgentPurple, modifier = Modifier.size(18.dp))
+                                    },
+                                    onClick = {
+                                        onThinkMode(ThinkMode.DEEP)
+                                        modeMenuOpen = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.weight(1f))
+
+                    // + 上传文档
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .clickable(onClick = onPickDoc),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "上传文档",
+                            tint = if (docName != null) AgentBlue
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
+
+                    // 发送 / 停止
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(CircleShape)
+                            // 三个分支统一成 Brush：混用 Color 会让 if 表达式退化成 Any，background 无重载可匹配
+                            .background(
+                                when {
+                                    generating -> Brush.linearGradient(
+                                        listOf(
+                                            MaterialTheme.colorScheme.errorContainer,
+                                            MaterialTheme.colorScheme.errorContainer
+                                        )
+                                    )
+                                    canSend -> Brush.linearGradient(
+                                        listOf(AgentBlue, lerp(AgentBlue, Color.White, 0.22f))
+                                    )
+                                    else -> Brush.linearGradient(
+                                        listOf(
+                                            MaterialTheme.colorScheme.surfaceVariant,
+                                            MaterialTheme.colorScheme.surfaceVariant
+                                        )
+                                    )
+                                }
+                            )
+                            .clickable { if (generating) onStop() else if (canSend) onSend() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            if (generating) Icons.Default.Stop else Icons.Default.ArrowUpward,
+                            contentDescription = if (generating) "停止生成" else "发送",
+                            tint = when {
+                                generating -> MaterialTheme.colorScheme.onErrorContainer
+                                canSend -> Color.White
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
             }
         }
