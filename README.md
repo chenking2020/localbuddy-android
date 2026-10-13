@@ -156,9 +156,9 @@ txt / Word / PDF / 图片的离线识别与翻译，支持格式还原导出，�
 
 不想编译的话，直接下载预编译安装包即可（模型已内置，装完即可离线使用）：
 
-- 文件：`xiaoxi端侧离线工作搭子.apk`
-- 链接：https://pan.baidu.com/s/18Fc9oFpRzoySbjHCXCH8aA
-- 提取码：`a6bb`
+- 文件：`localbuddy.apk`
+- 链接：https://pan.baidu.com/s/1NKrzKWp8pXWF9BFE48X4GA?pwd=66qg
+- 提取码：`66qg`
 
 安装要求：Android 8.0（API 26）及以上、arm64 设备；安装时需在系统设置中允许「未知来源应用」安装。首次启动会把内置模型解包到应用目录，耗时数分钟且需要较多存储空间，建议在网络与电量充足时完成。
 
@@ -167,8 +167,9 @@ txt / Word / PDF / 图片的离线识别与翻译，支持格式还原导出，�
 模型文件**不在仓库里**（总量约 4GB）。下载 `assets.zip` 后解压，把里面的目录放到 `app/src/main/assets/` 下：
 
 - 文件：`assets.zip`
-- 链接：https://pan.baidu.com/s/1Zx1eVrAPA90UvKNPhYkzDw
-- 提取码：`yk75`
+- 链接：https://pan.baidu.com/s/1APbhSQ7OZHqSB5UzO5aMHg?pwd=kmvt
+- 提取码：`kmvt`
+
 
 ```
 asr/    语音识别    mt/     机器翻译    llm/    端侧大模型
