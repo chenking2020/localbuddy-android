@@ -598,6 +598,7 @@ fun TextChatScreen(onBack: () -> Unit, vm: TextChatViewModel = viewModel()) {
         var stick = true                  // 是否跟随到底部
         var anchor: Pair<Int, Int>? = null
         var lastSize = 0
+        var lastViewportH = 0
 
         snapshotFlow {
             val m = s.messages
@@ -610,7 +611,8 @@ fun TextChatScreen(onBack: () -> Unit, vm: TextChatViewModel = viewModel()) {
                 thinkLen = last?.thinking?.length ?: -1,
                 anchorIndex = first?.index ?: -1,
                 anchorOffset = first?.offset ?: 0,
-                total = info.totalItemsCount
+                total = info.totalItemsCount,
+                viewportH = info.viewportSize.height
             )
         }
             .distinctUntilChanged()
@@ -619,18 +621,27 @@ fun TextChatScreen(onBack: () -> Unit, vm: TextChatViewModel = viewModel()) {
                 val a = snap.anchorIndex to snap.anchorOffset
                 val scrolled = a != anchor
                 anchor = a
+                // 视口高度变化（输入框展开 / 输入法弹出收起）：滚动位置没动但可视范围变了，
+                // 按"距底部距离"重判会误判成不在底部 → 从此不跟随。故这种变化只补滚、不改 stick。
+                val viewportChanged = lastViewportH != 0 && snap.viewportH != lastViewportH
+                lastViewportH = snap.viewportH
                 if (snap.size != lastSize) {
                     // 自己刚发的消息：无条件重新跟随。
                     // 必须优先于下面的锚点判断——新消息插进来时锚点也会变，
                     // 若先按锚点判定，此时还没滚过去，会被误判成"不在底部"而从此不滚。
                     stick = true
                     lastSize = snap.size
-                } else if (scrolled) {
+                } else if (scrolled && !viewportChanged) {
                     // 真的滚动过（用户翻历史 / 上一次跟滚）→ 按新位置重新判定
                     stick = listState.isNearBottom()
                 }
                 if (stick) listState.scrollToBottom()
             }
+    }
+
+    // 消息条数一变就无条件贴底一次：兜住上面 stick 万一被判成 false 之后"再也不跟随"的情况
+    LaunchedEffect(s.messages.size) {
+        if (s.messages.isNotEmpty()) listState.scrollToBottom()
     }
 
     // 不套 Scaffold 的 innerPadding：顶部由 AgentHeader 的 windowInsetsPadding(statusBars) 处理，
@@ -751,14 +762,21 @@ internal fun LazyListState.isNearBottom(thresholdPx: Int = 120): Boolean {
     return lastVisible.offset + lastVisible.size - info.viewportEndOffset <= thresholdPx
 }
 
-/** 一次"要不要跟滚"的判断快照：消息内容 + 列表滚动锚点。 */
+/**
+ * 一次"要不要跟滚"的判断快照：消息内容 + 列表滚动锚点 + 视口高度。
+ *
+ * [viewportH] 必须参与比较：输入框展开/输入法弹出都会让列表视口变矮，此时滚动位置不变
+ * 但可视范围变小，最后一条消息会被挤出视口（看起来就是"新消息被输入框挡住"）。
+ * 放进快照后视口一变就会重新走一次跟滚。
+ */
 internal data class BottomSnap(
     val size: Int,
     val textLen: Int,
     val thinkLen: Int,
     val anchorIndex: Int,
     val anchorOffset: Int,
-    val total: Int
+    val total: Int,
+    val viewportH: Int = 0
 )
 
 /** 推理模式切换 + 清空会话。做成一条与背景同色的圆角工具栏，弱化到不抢消息区的注意力。 */
@@ -1158,9 +1176,14 @@ internal fun PreparingRow(text: String, modifier: Modifier = Modifier) {
     }
 }
 
-/** 空态：品牌图标 + 引导语 + 2×2 的示例问题（点了填进输入框，不直接发送）。 */
+/**
+ * 空态：品牌图标 + 引导语 + 2×2 的示例问题（点了填进输入框，不直接发送）。
+ *
+ * @param compact 首页专用：上方已经有智能体卡片，这里只留图标 + 一句引导语，
+ *                说明小字和示例卡都不显示，避免首屏太挤。
+ */
 @Composable
-internal fun ChatEmptyState(onPick: (String) -> Unit) {
+internal fun ChatEmptyState(onPick: (String) -> Unit, compact: Boolean = false) {
     val samples = listOf(
         "用三句话解释什么是大语言模型" to "概念解释",
         "帮我写一封请假邮件，语气正式一点" to "文案写作",
@@ -1190,30 +1213,32 @@ internal fun ChatEmptyState(onPick: (String) -> Unit) {
         }
         Spacer(Modifier.height(16.dp))
         Text("开始一段离线对话", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "所有推理都在本机完成，不联网、不上传。切到「深度思考」会让模型先展开推理再作答；" +
-                "点输入框左侧的回形针可以上传文档，之后提问会先在你上传的内容里检索。",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            lineHeight = 20.sp,
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center
-        )
-        Spacer(Modifier.height(24.dp))
-        samples.chunked(2).forEach { row ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                row.forEach { (q, tag) ->
-                    SuggestionCard(
-                        text = q, tag = tag,
-                        modifier = Modifier.weight(1f),
-                        onClick = { onPick(q) }
-                    )
+        if (!compact) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "所有推理都在本机完成，不联网、不上传。切到「深度思考」会让模型先展开推理再作答；" +
+                    "点输入框左侧的回形针可以上传文档，之后提问会先在你上传的内容里检索。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                lineHeight = 20.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+            Spacer(Modifier.height(24.dp))
+            samples.chunked(2).forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    row.forEach { (q, tag) ->
+                        SuggestionCard(
+                            text = q, tag = tag,
+                            modifier = Modifier.weight(1f),
+                            onClick = { onPick(q) }
+                        )
+                    }
                 }
+                Spacer(Modifier.height(10.dp))
             }
-            Spacer(Modifier.height(10.dp))
         }
     }
 }
@@ -1252,7 +1277,7 @@ internal fun SuggestionCard(
  * 豆包式输入卡片：
  * - 未聚焦时是紧凑单行（输入框 + 语音 + 发送）；
  * - 点击聚焦后展开成大卡片：上面是多行输入区（高度变大），下面一行操作按钮——
- *   语音（按住说话）、⚡快速/精致选择、+（上传文档）、圆形发送键。
+ *   语音（点击开启/关闭，转写文字实时填入输入框）、⚡快速/精致选择、+（上传文档）、圆形发送键。
  */
 internal fun ChatInputBar(
     value: String,
@@ -1269,11 +1294,11 @@ internal fun ChatInputBar(
     onThinkMode: ((ThinkMode) -> Unit)? = null,
     /** 输入框焦点变化回调（展开/收起也由这里驱动）。 */
     onFocusChange: (Boolean) -> Unit = {},
-    /** 是否显示语音输入按钮（按住说话、松开发送）。 */
+    /** 是否显示语音输入按钮（点击开启/关闭语音转写）。 */
     showMic: Boolean = false,
-    /** 语音按钮的手势 modifier：首页用长按手势，不能是普通 clickable。 */
-    micModifier: Modifier = Modifier,
-    /** 正在录音：按钮转为按下态。 */
+    /** 点击语音按钮：开启/关闭语音输入（转写文字实时追加进输入框）。 */
+    onMicClick: () -> Unit = {},
+    /** 语音输入进行中：按钮转为激活态（红色底）。 */
     micActive: Boolean = false
 ) {
     val navBar = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
@@ -1394,7 +1419,7 @@ internal fun ChatInputBar(
                     modifier = Modifier.padding(start = 10.dp, end = 12.dp, bottom = 10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // 语音输入：按住说话、松开发送
+                    // 语音输入：点击开启/关闭，转写文字实时写进输入框
                     if (showMic) {
                         Box(
                             modifier = Modifier
@@ -1404,12 +1429,12 @@ internal fun ChatInputBar(
                                 .background(
                                     if (micActive) Color(0xFFDC2626) else Color.Transparent
                                 )
-                                .then(micModifier),
+                                .clickable(onClick = onMicClick),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Mic,
-                                contentDescription = "按住说话",
+                                contentDescription = if (micActive) "停止语音输入" else "语音输入",
                                 tint = if (micActive) Color.White
                                 else MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(21.dp)

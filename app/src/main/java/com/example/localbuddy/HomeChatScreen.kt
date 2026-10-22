@@ -2,6 +2,7 @@ package com.example.localbuddy
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,8 +14,6 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.GestureCancellationException
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -62,7 +61,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
@@ -75,12 +73,13 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 首页两种交互模式：文本对话 / 语音通话。
@@ -94,8 +93,10 @@ enum class HomeChatMode(val label: String) {
 /** 首页智能体宫格一行几张小卡片。 */
 private const val AGENT_GRID_COLUMNS = 3
 
-/** 语音输入的三个阶段：空闲 / 录音中 / 识别中。 */
-private enum class VoiceInputPhase { IDLE, RECORDING, RECOGNIZING }
+/** 语音输入的阶段：空闲 / 加载模型 / 录音转写中 / 停止后收尾识别中。 */
+private enum class VoiceInputPhase { IDLE, LOADING, RECORDING, RECOGNIZING }
+
+private const val TAG = "HomeChatScreen"
 
 /**
  * 融合首页：顶部应用栏 + 六个智能体小卡片 + 模式切换 + 对话/通话区 + 底部输入/通话控件。
@@ -155,8 +156,16 @@ fun HomeChatScreen(
     var voicePhase by remember { mutableStateOf(VoiceInputPhase.IDLE) }
     var voiceError by remember { mutableStateOf<String?>(null) }
     var recorder by remember { mutableStateOf<MicRecorder?>(null) }
-    /** 手势被取消时置位，让录音协程丢弃这段音频。 */
-    val voiceCancel = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    /** 已请求停止：模型还在加载时点了停止/切走，采集协程据此不再开麦。 */
+    val voiceStop = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    /** 剩余语音整段丢弃（发送/切模式时不再往输入框里补字）。 */
+    val voiceDiscard = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    /** 本轮转写「已确认」的文字前缀 = 输入框里除当前段流式文本之外的内容。 */
+    var voiceBase by remember { mutableStateOf("") }
+    /** 采集 → 推理的音频段队列：有界、推理跟不上时丢最旧段，不让推理拖住麦克风。 */
+    var voiceChannel by remember { mutableStateOf<Channel<FloatArray>?>(null) }
+    /** 当前正在转写的段序号：只让最新一段的流式文本进输入框，避免迟到 token 写花内容。 */
+    val voiceSegSeq = remember { java.util.concurrent.atomic.AtomicInteger(0) }
 
     val micLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -186,6 +195,109 @@ fun HomeChatScreen(
     }
 
     /**
+     * 开启语音输入：采集与推理解耦（同 SpeechMT 录音模式）——
+     * 采集协程只读麦克风、把 VAD 段塞进有界 Channel；推理协程按序消费做 ASR，
+     * 并把结果实时追加到输入框现有文字之后（[appendVoiceText]）。
+     *
+     * 以开启瞬间输入框里的内容为基准 [voiceBase]，之后每段转写都追加在它后面，
+     * 所以「打字写一半 → 开麦接着说」或「说完停止 → 再开一次」都能续在同一段文字里。
+     */
+    fun startVoiceInput() {
+        if (voicePhase != VoiceInputPhase.IDLE) return
+        voiceError = null
+        voiceStop.set(false)
+        voiceDiscard.set(false)
+        requireMic({
+            voiceBase = ts.input
+            voicePhase = VoiceInputPhase.LOADING
+            val rec = MicRecorder(pauseMs = 900, maxSegMs = 8_000)
+            recorder = rec
+            val ch = Channel<FloatArray>(capacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+            voiceChannel = ch
+
+            // ① 采集协程：只管麦克风，推理快慢不影响录音；队列满丢最旧段
+            scope.launch(Dispatchers.IO) {
+                val engine = SpeechMTEngine.get(context.applicationContext)
+                try {
+                    engine.warmUp()                  // 幂等；首次会解包并加载 ASR 模型
+                    // 加载期间用户可能已点停止
+                    if (voiceStop.get()) return@launch
+                    withContext(Dispatchers.Main) { voicePhase = VoiceInputPhase.RECORDING }
+                    // trySend：停止后若队列已关闭也不抛异常（send 会抛 ClosedSendChannelException）
+                    rec.stream().collect { ch.trySend(it) }
+                } catch (e: Throwable) {
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "voice capture failed", e)
+                    withContext(Dispatchers.Main) {
+                        voiceError = "录音失败：${e.message ?: "未知错误"}"
+                    }
+                } finally {
+                    rec.stop()
+                    // 采集结束 → 推理排空后退出；可能已被 stopVoiceInput 关过，忽略重复关闭
+                    runCatching { ch.close() }
+                }
+            }
+
+            // ② 推理协程：按序转写，token 级流式先顶到输入框，段结束再固化到 [voiceBase]
+            scope.launch(Dispatchers.Default) {
+                val engine = SpeechMTEngine.get(context.applicationContext)
+                for (pcm in ch) {
+                    if (voiceDiscard.get()) break
+                    val seg = voiceSegSeq.incrementAndGet()
+                    val text = runCatching {
+                        engine.asrDetect(AudioDecoder.normalizePeak(pcm)) { partial ->
+                            // 当前段的流式结果：输入框 = 已确认前缀 + 正在生成的这段
+                            val p = partial.trimStart()
+                            if (p.isNotEmpty() && voiceSegSeq.get() == seg) {
+                                scope.launch(Dispatchers.Main.immediate) {
+                                    if (voiceSegSeq.get() == seg) {
+                                        textVm.setInput(appendVoiceText(voiceBase, p))
+                                    }
+                                }
+                            }
+                        }.text.trim()
+                    }.onFailure { Log.e(TAG, "asr failed", it) }.getOrNull()
+                    withContext(Dispatchers.Main) {
+                        if (voiceDiscard.get()) return@withContext
+                        // 段完成：以已确认前缀为基准追加；若期间用户手动改过或已发送清空了
+                        // 输入框，则以输入框当前内容为新基准，避免把旧文字又写回去
+                        val base = if (ts.input.startsWith(voiceBase)) voiceBase else ts.input
+                        voiceBase = if (text.isNullOrBlank()) base else appendVoiceText(base, text)
+                        textVm.setInput(voiceBase)
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    recorder = null
+                    voiceChannel = null
+                    voicePhase = VoiceInputPhase.IDLE
+                }
+            }
+        }, "需要麦克风权限才能使用语音输入")
+    }
+
+    /**
+     * 停止语音输入。已采集但未转写的段会继续识别完并追加进输入框；
+     * @param discard 为 true 时剩余段直接丢弃（发送/切换模式场景：不该再往输入框里补字）。
+     */
+    fun stopVoiceInput(discard: Boolean = false) {
+        if (voicePhase == VoiceInputPhase.IDLE) return
+        voiceStop.set(true)
+        if (discard) voiceDiscard.set(true)
+        recorder?.stop()                     // 采集流退出 → channel.close() → 推理排空后回 IDLE
+        // 兜底：模型还在加载、采集流根本没起来时，直接关队列让推理协程退出
+        runCatching { voiceChannel?.close() }
+        if (voicePhase != VoiceInputPhase.RECOGNIZING) voicePhase = VoiceInputPhase.RECOGNIZING
+    }
+
+    /**
+     * 语音输入开关：点一下开启（录音 + 实时转写，文字逐段追加进输入框），
+     * 再点一下停止——剩下的尾巴识别完也追加进去。之后就完全等同手打的文字，由用户点发送。
+     */
+    fun toggleVoiceInput() {
+        if (voicePhase == VoiceInputPhase.IDLE) startVoiceInput() else stopVoiceInput()
+    }
+
+    /**
      * 切到某个模式。两种模式都要用麦克风，LLM 推理同时只能服务一路，所以切换前先把另一路停下来。
      */
     fun switchTo(m: HomeChatMode) {
@@ -193,7 +305,7 @@ fun HomeChatScreen(
         if (m == HomeChatMode.VOICE) {
             focusManager.clearFocus()
             if (ts.generating) textVm.stop()
-            recorder?.stop()          // 语音输入正在录的话先收掉，别和通话抢麦克风
+            stopVoiceInput(discard = true)   // 语音输入还在录的话先收掉，别和通话抢麦克风
         } else {
             callVm.hangUp()
         }
@@ -207,83 +319,14 @@ fun HomeChatScreen(
         switchTo(m)
     }
 
-    /**
-     * 语音输入：按住说话 → 松开结束录音 → 端侧 ASR → 转写文本直接发起对话（与微信一致）。
-     * [voiceCancel] 用于「手势被系统打断」时丢弃这段录音。
-     */
-    fun beginVoiceInput() {
-        if (voicePhase != VoiceInputPhase.IDLE || ts.generating) return
-        voiceCancel.set(false)
-        requireMic({
-            scope.launch(Dispatchers.Default) {
-                voicePhase = VoiceInputPhase.RECORDING
-                val rec = MicRecorder(pauseMs = 800, maxSegMs = 20_000)
-                recorder = rec
-                // 30 秒还没等到一句完整的话就自动收尾，避免一直占着麦克风
-                val pcm = withTimeoutOrNull(30_000L) { rec.stream().firstOrNull() } ?: FloatArray(0)
-                rec.stop()
-                recorder = null
-                if (pcm.isEmpty() || voiceCancel.get()) {
-                    voicePhase = VoiceInputPhase.IDLE
-                    return@launch
-                }
-                voicePhase = VoiceInputPhase.RECOGNIZING
-                val result = runCatching {
-                    val engine = SpeechMTEngine.get(context.applicationContext)
-                    engine.warmUp()                       // 幂等；首次会解包并加载 ASR 模型
-                    engine.asrDetect(pcm).text.trim()
-                }
-                withContext(Dispatchers.Main) {
-                    voicePhase = VoiceInputPhase.IDLE
-                    result.onSuccess { text ->
-                        if (text.isBlank()) {
-                            voiceError = "没听清，请再说一次"
-                        } else {
-                            focusManager.clearFocus()
-                            textVm.setInput(text)
-                            textVm.send()
-                        }
-                    }.onFailure { e ->
-                        voiceError = "语音识别失败：${e.message ?: "未知错误"}"
-                    }
-                }
-            }
-        }, "需要麦克风权限才能使用语音输入")
-    }
-
-    /**
-     * 松开手指：结束录音并进入识别。
-     * @param cancelled 手势被取消（手指滑出按钮、被系统打断）——这段录音直接丢弃，不识别。
-     */
-    fun finishVoiceInput(cancelled: Boolean) {
-        if (voicePhase != VoiceInputPhase.RECORDING) {
-            // 还没真正开始录（例如卡在权限弹窗上），松手就当作放弃这次输入
-            voiceCancel.set(true)
-            return
-        }
-        if (cancelled) voiceCancel.set(true)
-        recorder?.stop()
-    }
-
-    // 按住说话、松开发送：与微信语音输入一致
-    val micGesture = Modifier.pointerInput(Unit) {
-        detectTapGestures(
-            onPress = {
-                beginVoiceInput()
-                val released = try {
-                    tryAwaitRelease()
-                    true
-                } catch (e: GestureCancellationException) {
-                    false
-                }
-                finishVoiceInput(cancelled = !released)
-            }
-        )
-    }
-
     // 离开首页彻底释放麦克风：本页不像 VoiceCallScreen 那样有单独的返回动作，
     // 只能在页面销毁时兜底挂断。
-    DisposableEffect(Unit) { onDispose { callVm.hangUp() } }
+    DisposableEffect(Unit) {
+        onDispose {
+            callVm.hangUp()
+            stopVoiceInput(discard = true)
+        }
+    }
 
     // ── 文本流式输出的自动跟随 ──
     // 与 TextChatScreen 同一套逻辑（常驻协程 + 滚动锚点），不能写成
@@ -292,6 +335,7 @@ fun HomeChatScreen(
         var stick = true
         var anchor: Pair<Int, Int>? = null
         var lastSize = 0
+        var lastViewportH = 0
 
         snapshotFlow {
             val m = ts.messages
@@ -304,7 +348,8 @@ fun HomeChatScreen(
                 thinkLen = last?.thinking?.length ?: -1,
                 anchorIndex = first?.index ?: -1,
                 anchorOffset = first?.offset ?: 0,
-                total = info.totalItemsCount
+                total = info.totalItemsCount,
+                viewportH = info.viewportSize.height
             )
         }
             .distinctUntilChanged()
@@ -313,14 +358,24 @@ fun HomeChatScreen(
                 val a = snap.anchorIndex to snap.anchorOffset
                 val scrolled = a != anchor
                 anchor = a
+                // 视口变矮/变高（输入框展开、输入法弹出收起）：此时列表位置没动但可视范围变了，
+                // 不能拿"距底部距离"重新判定——那样会误判成不在底部、从此不再跟随，
+                // 只剩"贴着底部的补一次滚"。
+                val viewportChanged = lastViewportH != 0 && snap.viewportH != lastViewportH
+                lastViewportH = snap.viewportH
                 if (snap.size != lastSize) {
                     stick = true
                     lastSize = snap.size
-                } else if (scrolled) {
+                } else if (scrolled && !viewportChanged) {
                     stick = chatList.isNearBottom()
                 }
                 if (stick) chatList.scrollToBottom()
             }
+    }
+
+    // 消息条数一变就无条件贴底一次：兜住上面 stick 万一被判成 false 之后"再也不跟随"的情况
+    LaunchedEffect(ts.messages.size) {
+        if (ts.messages.isNotEmpty()) chatList.scrollToBottom()
     }
 
     // 通话转写追加时滚到最新一条
@@ -397,12 +452,14 @@ fun HomeChatScreen(
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 if (mode == HomeChatMode.TEXT) {
                     if (ts.messages.isEmpty()) {
-                        ChatEmptyState(onPick = { textVm.setInput(it) })
+                        // 首屏已有智能体卡片，空态只留一句引导语，不占空间
+                        ChatEmptyState(onPick = { textVm.setInput(it) }, compact = true)
                     } else {
                         LazyColumn(
                             state = chatList,
                             modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                            // 底部多留一点：最后一条气泡不贴着输入栏，视觉上不会被压住
+                            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp),
                             verticalArrangement = Arrangement.spacedBy(14.dp)
                         ) {
                             items(ts.messages, key = { it.id }) { m ->
@@ -466,13 +523,20 @@ fun HomeChatScreen(
                     docChars = ts.docChars,
                     onRemoveDoc = textVm::removeDoc,
                     onPickDoc = { runCatching { pickLauncher.launch(pickMimes) } },
-                    onSend = { focusManager.clearFocus(); textVm.send() },
+                    onSend = {
+                        focusManager.clearFocus()
+                        stopVoiceInput(discard = true)   // 发送即结束本轮转写，剩余不再补字
+                        textVm.send()
+                    },
                     onStop = textVm::stop,
                     thinkMode = ts.thinkMode,
                     onThinkMode = textVm::setThinkMode,
+                    // 输入框展开（点输入框/弹输入法）会把列表视口挤矮，补一次滚到底，
+                    // 免得最后一条消息被挤到看不见的地方
+                    onFocusChange = { if (it) scope.launch { chatList.scrollToBottom() } },
                     showMic = true,
-                    micModifier = micGesture,
-                    micActive = voicePhase == VoiceInputPhase.RECORDING
+                    onMicClick = ::toggleVoiceInput,
+                    micActive = voicePhase != VoiceInputPhase.IDLE
                 )
             } else {
                 CallControls(
@@ -488,6 +552,22 @@ fun HomeChatScreen(
     }
 }
 
+/**
+ * 把新一段转写追加到已有文字后面：中文直接连接，只有两侧都是英文/数字时才补空格，
+ * 免得 "hello"+"world" 粘成 "helloworld"（中文补空格会很难看，故只在 ASCII 词间接）。
+ */
+private fun appendVoiceText(base: String, text: String): String {
+    if (base.isBlank()) return text.trimStart()
+    if (text.isBlank()) return base.trimEnd()
+    val b = base.trimEnd()
+    val t = text.trimStart()
+    val space = if (isAsciiWordChar(b.last()) && isAsciiWordChar(t.first())) " " else ""
+    return b + space + t
+}
+
+private fun isAsciiWordChar(c: Char): Boolean =
+    c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9'
+
 // ── 语音输入状态条 ──
 @Composable
 private fun VoiceInputBar(phase: VoiceInputPhase, modifier: Modifier = Modifier) {
@@ -500,31 +580,47 @@ private fun VoiceInputBar(phase: VoiceInputPhase, modifier: Modifier = Modifier)
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        if (phase == VoiceInputPhase.RECORDING) {
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFFDC2626))
-            )
-            Text(
-                text = "正在说话…松开手指即发送，手指滑开可取消",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f)
-            )
-        } else {
-            CircularProgressIndicator(
-                modifier = Modifier.size(13.dp),
-                strokeWidth = 2.dp,
-                color = AgentRose
-            )
-            Text(
-                text = "正在识别…首次使用需要加载语音识别模型，请稍候",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f)
-            )
+        when (phase) {
+            VoiceInputPhase.RECORDING -> {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFFDC2626))
+                )
+                Text(
+                    text = "正在听…转写文字实时写入输入框，点击麦克风按钮结束",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            VoiceInputPhase.RECOGNIZING -> {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(13.dp),
+                    strokeWidth = 2.dp,
+                    color = AgentRose
+                )
+                Text(
+                    text = "正在识别最后一段…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            else -> {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(13.dp),
+                    strokeWidth = 2.dp,
+                    color = AgentRose
+                )
+                Text(
+                    text = "正在加载语音识别模型…首次使用需要一点时间",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
     }
 }
